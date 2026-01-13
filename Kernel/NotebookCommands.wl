@@ -272,6 +272,109 @@ ExecuteNotebookCommand["CreateFunctionResourceNotebook", params_Association] := 
     <|"success" -> True, "notebook" -> ToString[nb], "note" -> "Created Function Resource notebook template"|>
 ];
 
+(* ::Subsection::Closed:: *)
+(*Button and Mouse Commands*)
+
+(* Helper to bring Wolfram Desktop to front using macOS osascript *)
+focusWolframDesktop[] := Module[{result},
+    result = RunProcess[{
+        "osascript", "-e",
+        "tell application \"System Events\" to set frontmost of process \"WolframNB\" to true"
+    }];
+    result["ExitCode"] === 0
+];
+
+ExecuteNotebookCommand["FocusWolframDesktop", params_Association] := Module[{success},
+    success = focusWolframDesktop[];
+    If[success,
+        <|"success" -> True, "message" -> "Mathematica brought to front"|>,
+        <|"error" -> "Failed to activate Mathematica"|>
+    ]
+];
+
+ExecuteNotebookCommand["ListButtons", params_Association] := Module[
+    {spec, nb, positions, getBoxPositions},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    (* Use ResourceFunction to get button positions *)
+    getBoxPositions = ResourceFunction["GetBoxPositions"];
+    positions = Quiet[getBoxPositions[nb, "ButtonBox"]];
+
+    If[!MatchQ[positions, _Association | _List],
+        Return[<|"error" -> "Failed to get button positions"|>]
+    ];
+
+    <|
+        "success" -> True,
+        "notebook" -> ToString[nb],
+        "buttons" -> If[AssociationQ[positions], positions["ButtonBox"], positions]
+    |>
+];
+
+ExecuteNotebookCommand["ClickButton", params_Association] := Module[
+    {spec, nb, target, targetNb, index, x, y, positions, pos, getBoxPositions, moveMouse},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    target = Lookup[params, "target", Missing[]]; (* Target notebook for insertion *)
+    index = Lookup[params, "index", 1];
+    x = Lookup[params, "x", Missing[]];
+    y = Lookup[params, "y", Missing[]];
+
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    getBoxPositions = ResourceFunction["GetBoxPositions"];
+    moveMouse = ResourceFunction["MoveMouse"];
+
+    (* If x,y provided, use those; otherwise get from button index *)
+    If[NumericQ[x] && NumericQ[y],
+        pos = {x, y},
+        (* Get button positions and use index *)
+        positions = Quiet[getBoxPositions[nb, "ButtonBox"]];
+        If[!MatchQ[positions, _Association | _List],
+            Return[<|"error" -> "Failed to get button positions"|>]
+        ];
+        positions = If[AssociationQ[positions], positions["ButtonBox"], positions];
+        If[!ListQ[positions] || Length[positions] < index,
+            Return[<|"error" -> "Button index out of range"|>]
+        ];
+        pos = positions[[index]]
+    ];
+
+    (* If target specified, select it first (where palette will insert content) *)
+    If[StringQ[target],
+        targetNb = getNotebook[target];
+        If[MatchQ[targetNb, _NotebookObject], SetSelectedNotebook[targetNb]]
+    ];
+
+    (* Bring Wolfram Desktop to front using osascript, then click *)
+    (* GetBoxPositions returns screen absolute coords, so use All scope *)
+    focusWolframDesktop[];
+    Pause[0.3]; (* Delay for window to come to front *)
+    moveMouse[All, pos, "Click"];
+
+    <|"success" -> True, "clicked" -> pos, "target" -> If[StringQ[target], target, "none"]|>
+];
+
+ExecuteNotebookCommand["MouseClick", params_Association] := Module[
+    {x, y, scope, moveMouse},
+    x = Lookup[params, "x", Missing[]];
+    y = Lookup[params, "y", Missing[]];
+    scope = Lookup[params, "scope", "All"]; (* "All" for screen coordinates *)
+
+    If[!NumericQ[x] || !NumericQ[y],
+        Return[<|"error" -> "x and y coordinates required"|>]
+    ];
+
+    moveMouse = ResourceFunction["MoveMouse"];
+
+    (* Click at coordinates *)
+    moveMouse[If[scope === "All", All, InputNotebook[]], {x, y}, "Click"];
+
+    <|"success" -> True, "clicked" -> {x, y}, "scope" -> scope|>
+];
+
 (* Default handler for unknown commands *)
 ExecuteNotebookCommand[cmd_, _] := <|"error" -> "Unknown command: " <> ToString[cmd]|>;
 
