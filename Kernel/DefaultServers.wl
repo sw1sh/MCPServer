@@ -352,9 +352,31 @@ getNotebookImage // endDefinition;
 (*NotebookCommand*)
 $notebookCommandDescription = "\
 Executes a command on the desktop Mathematica application via the WolframNotebook palette. \
-Available commands: Ping, ListNotebooks, GetNotebookImage, SelectNotebook, EvaluateInNotebook, \
-InsertCell, GetSelectedCells, DeleteCells, ReloadCommands, CreateNotebook, SaveNotebook, \
-CloseNotebook, OpenNotebook, FrontEndToken. \
+Available commands: Ping, ListNotebooks, GetNotebookImage, GetAllNotebooksImage, CaptureScreen, \
+SelectNotebook, EvaluateInNotebook, InsertCell, GetSelectedCells, DeleteCells, ReloadCommands, \
+CreateNotebook, SaveNotebook, CloseNotebook, OpenNotebook, FrontEndToken, FocusWolframDesktop, \
+ListButtons, ClickButton, MouseClick, SendKeys.
+
+IMPORTANT WORKFLOW FOR DESKTOP INTERACTION:
+1. ALWAYS start with CaptureScreen or ListNotebooks to see current state
+2. Use GetNotebookImage to see a specific notebook's content
+3. Use FocusWolframDesktop to bring Wolfram to foreground before clicking
+4. Use ListButtons to get button positions in a palette BEFORE clicking
+5. Use ClickButton with 'target' param to specify where palette inserts content
+6. Use SendKeys for keyboard input (text characters)
+
+COMMAND REFERENCE:
+- CaptureScreen: Full desktop screenshot
+- ListNotebooks: List all open notebooks
+- GetNotebookImage(notebook, resolution): Screenshot of specific notebook
+- GetAllNotebooksImage(resolution): Collage of all notebooks
+- FocusWolframDesktop: Bring Wolfram to front (required before clicking)
+- ListButtons(notebook): Get button positions in a notebook/palette
+- ClickButton(notebook, index, target): Click button by index, target=notebook for insertion
+- SendKeys(text, notebook): Send keyboard input
+- EvaluateInNotebook(notebook, code): Evaluate code in a notebook
+- SelectNotebook(notebook): Set a notebook as selected
+
 Pass command-specific parameters as JSON in the params field.";
 
 $defaultMCPTools[ "NotebookCommand" ] := LLMTool @ <|

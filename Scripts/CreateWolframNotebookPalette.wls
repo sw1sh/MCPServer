@@ -1,3 +1,4 @@
+#!/usr/bin/env wolframscript
 (* ::Package:: *)
 (* WolframNotebook Palette Generator *)
 (* Run this script to create and optionally install the palette *)
@@ -6,6 +7,7 @@ BeginPackage["Wolfram`MCPServer`WolframNotebookPalette`"];
 
 CreateWolframNotebookPalette::usage = "CreateWolframNotebookPalette[] creates and displays the WolframNotebook palette.";
 InstallWolframNotebookPalette::usage = "InstallWolframNotebookPalette[] installs the palette to the user's Palettes directory.";
+ExportWolframNotebookPalette::usage = "ExportWolframNotebookPalette[] exports the palatte."
 
 Begin["`Private`"];
 
@@ -178,7 +180,7 @@ CreateWolframNotebookPalette[] := CreatePalette[
 ExportWolframNotebookPalette[] := Module[{notebook, file, dir},
     notebook = Notebook[{
         Cell[BoxData[ToBoxes[
-            DynamicModule[{status = "Disconnected", listener = None, port = $defaultPort, clients = {}, errorMsg = ""},
+            DynamicModule[{status = "Disconnected", listener = None, port = $defaultPort, clients = {}, errorMsg = "", commandLog = {}},
                 Column[{
                     Style["WolframNotebook Server", Bold, 11],
                     Dynamic @ Row[{
@@ -199,7 +201,7 @@ ExportWolframNotebookPalette[] := Module[{notebook, file, dir},
                             (* Close any existing listeners on this port *)
                             Quiet[Scan[Close, Select[Sockets[], #["DestinationPort"] === port &]]];
                             Module[{result, msg},
-                                result = SocketListen[port, Function[event, handleSocketEvent[Dynamic[status], Dynamic[clients]][event]]];
+                                result = SocketListen[port, Function[event, handleSocketEvent[Dynamic[status], Dynamic[clients], Dynamic[commandLog]][event]]];
                                 If[MatchQ[result, _SocketListener],
                                     listener = result; status = "Listening",
                                     status = "Error"; listener = None;
@@ -214,13 +216,33 @@ ExportWolframNotebookPalette[] := Module[{notebook, file, dir},
                         Method -> "Queued",
                         ImageSize -> {60, 20}
                     ],
-                    Style["Start before MCP", 7, Gray]
+                    (* Command log display - always show section with scrollbar *)
+                    Style["Recent Commands:", 8, Bold],
+                    Pane[
+                        Dynamic[
+                            If[Length[commandLog] > 0,
+                                Column[
+                                    Style[#, 7, Gray] & /@ Take[commandLog, UpTo[10]],
+                                    Spacings -> 0
+                                ],
+                                Style["Waiting for commands...", 7, LightGray]
+                            ],
+                            TrackedSymbols :> {commandLog}
+                        ],
+                        ImageSize -> {180, 80},
+                        Scrollbars -> {False, Automatic},
+                        AppearanceElements -> None
+                    ]
                 }, Alignment -> Center, Spacings -> 0.1],
                 Initialization :> (
                     SocketListen::err = "Port `1`: `2`";
 
-                    handleSocketEvent[Dynamic[statusVar_], Dynamic[clientsVar_]][event_Association] := Module[
-                        {data, request, command, params, result, response, sourceSocket},
+                    (* Load the paclet once at initialization *)
+                    PacletDirectoryLoad["/Users/swish/src/wolfram/MCPServer"];
+                    Get["Wolfram`MCPServer`NotebookCommands`"];
+
+                    handleSocketEvent[Dynamic[statusVar_], Dynamic[clientsVar_], Dynamic[logVar_]][event_Association] := Module[
+                        {data, request, command, params, result, response, sourceSocket, timestamp},
                         sourceSocket = event["SourceSocket"];
                         If[!MemberQ[clientsVar, sourceSocket], AppendTo[clientsVar, sourceSocket]; statusVar = "Connected"];
                         data = event["Data"];
@@ -231,15 +253,42 @@ ExportWolframNotebookPalette[] := Module[{notebook, file, dir},
                             command = Lookup[request, "command", "unknown"];
                             params = Lookup[request, "params", <||>];
 
+                            (* Log the command with key params *)
+                            timestamp = DateString[{"Hour", ":", "Minute", ":", "Second"}];
+                            Module[{logEntry, paramStr},
+                                paramStr = Switch[command,
+                                    "ClickButton", " idx:" <> ToString[Lookup[params, "index", "?"]] <> " nb:" <> StringTake[ToString[Lookup[params, "notebook", "?"]], UpTo[10]],
+                                    "SendArrowKey", " " <> ToString[Lookup[params, "direction", "?"]],
+                                    "MouseClick", " x:" <> ToString[Lookup[params, "x", "?"]] <> " y:" <> ToString[Lookup[params, "y", "?"]],
+                                    _, ""
+                                ];
+                                logEntry = timestamp <> " " <> command <> paramStr;
+                                PrependTo[logVar, logEntry]
+                            ];
+                            If[Length[logVar] > 20, logVar = Take[logVar, 20]];
+
                             (* Pure dispatcher - all commands go to paclet *)
                             result = Wolfram`MCPServer`NotebookCommands`ExecuteNotebookCommand[command, params];
 
                             response = ExportString[<|
                                 "id" -> Lookup[request, "id", "unknown"],
                                 "status" -> If[KeyExistsQ[result, "error"], "error", "success"],
-                                "result" -> result
+                                "result" -> result,
+                                If[KeyExistsQ[result, "error"], "error" -> result["error"], Nothing]
                             |>, "JSON"];
                             WriteString[sourceSocket, response <> "\n"]
+                        ]
+                    ];
+
+                    (* Auto-start listener *)
+                    If[listener === None,
+                        commandLog = {"Palette initialized"};
+                        Quiet[Scan[Close, Select[Sockets[], #["DestinationPort"] === port &]]];
+                        With[{res = SocketListen[port, Function[event, handleSocketEvent[Dynamic[status], Dynamic[clients], Dynamic[commandLog]][event]]]},
+                             If[MatchQ[res, _SocketListener],
+                                 listener = res; status = "Listening";
+                                 PrependTo[commandLog, "Listening on port " <> ToString[port]]
+                             ]
                         ]
                     ];
                 )
@@ -256,9 +305,11 @@ ExportWolframNotebookPalette[] := Module[{notebook, file, dir},
         WindowFrameElements -> {"CloseBox"},
         Saveable -> False,
         WindowFloating -> True,
-        WindowClickSelect -> True,
+        WindowClickSelect -> False, (* Don't steal focus when clicking *)
         Editable -> True,
         Selectable -> True,
+        ShowCellBracket -> False,
+        WindowToolbars -> {},
         StyleDefinitions -> "Palette.nb"
     ];
 
@@ -286,8 +337,8 @@ InstallWolframNotebookPalette[] := If[$Notebooks === True,
 End[];
 EndPackage[];
 
-(* If run as a script, install the palette *)
+(* If run as a script, export the palette *)
 If[$ScriptCommandLine =!= {},
     Needs["Wolfram`MCPServer`WolframNotebookPalette`"];
-    InstallWolframNotebookPalette[]
+    ExportWolframNotebookPalette[]
 ];
