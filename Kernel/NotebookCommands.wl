@@ -578,6 +578,193 @@ ExecuteNotebookCommand["EvaluateSilent", params_Association] := Module[
     <|"success" -> True, "result" -> ToString[result, InputForm]|>
 ];
 
+(* Evaluate a cell by index - select it and evaluate with FrontEndToken *)
+ExecuteNotebookCommand["EvaluateCellByIndex", params_Association] := Module[
+    {spec, idx, nb, cells, cell, style},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    idx = Lookup[params, "index", 1];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    cells = Cells[nb];
+    If[idx < 1 || idx > Length[cells],
+        Return[<|"error" -> "Index out of range", "cellCount" -> Length[cells]|>]
+    ];
+
+    cell = cells[[idx]];
+    style = CurrentValue[cell, CellStyle];
+
+    (* Select the cell and evaluate it *)
+    SetSelectedNotebook[nb];
+    SelectionMove[cell, All, Cell];
+    FrontEndTokenExecute[nb, "EvaluateCells"];
+
+    <|"success" -> True, "index" -> idx, "style" -> ToString[style],
+      "note" -> "Cell selected and evaluation initiated"|>
+];
+
+(* Open or close a cell group by index *)
+ExecuteNotebookCommand["OpenCellGroup", params_Association] := Module[
+    {spec, idx, nb, cells, cell},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    idx = Lookup[params, "index", 1];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    cells = Cells[nb];
+    If[idx < 1 || idx > Length[cells],
+        Return[<|"error" -> "Index out of range", "cellCount" -> Length[cells]|>]
+    ];
+
+    cell = cells[[idx]];
+    SetSelectedNotebook[nb];
+    SelectionMove[cell, All, Cell];
+    FrontEndTokenExecute[nb, "OpenCloseGroup"];
+
+    <|"success" -> True, "index" -> idx, "note" -> "Cell group toggled"|>
+];
+
+(* Select the contents of a cell by index - for use with TriggerTemplateInput *)
+ExecuteNotebookCommand["SelectCellContents", params_Association] := Module[
+    {spec, idx, nb, cells, cell, style},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    idx = Lookup[params, "index", 1];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    cells = Cells[nb];
+    If[idx < 1 || idx > Length[cells],
+        Return[<|"error" -> "Index out of range", "cellCount" -> Length[cells]|>]
+    ];
+
+    cell = cells[[idx]];
+    style = CurrentValue[cell, CellStyle];
+
+    (* Select the cell contents - NOT the cell bracket *)
+    SetSelectedNotebook[nb];
+    SelectionMove[cell, All, CellContents];
+
+    <|"success" -> True, "index" -> idx, "style" -> ToString[style],
+      "note" -> "Cell contents selected (not cell bracket)"|>
+];
+
+(* Toggle a WFR category checkbox by category name *)
+ExecuteNotebookCommand["ToggleWFRCategory", params_Association] := Module[
+    {spec, category, nb, cells, catCells, catCell, content, newContent, toggled},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    category = Lookup[params, "category", ""];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+    If[category === "", Return[<|"error" -> "Category name required"|>]];
+
+    (* Find cells with Categories-Checkboxes tag *)
+    cells = Cells[nb];
+    catCells = Select[cells, MemberQ[Flatten[{CurrentValue[#, CellTags]}], "Categories-Checkboxes"] &];
+    If[Length[catCells] == 0, Return[<|"error" -> "No Categories cell found"|>]];
+
+    catCell = First[catCells];
+    content = NotebookRead[catCell];
+
+    (* Toggle checkbox for the specified category *)
+    toggled = False;
+    newContent = content /. {
+        CheckboxBox[False, {False, cat_String}] /; StringContainsQ[cat, category] :>
+            (toggled = True; CheckboxBox[cat, {False, cat}]),
+        CheckboxBox[val_String, {False, cat_String}] /; StringContainsQ[cat, category] && val === cat :>
+            (toggled = True; CheckboxBox[False, {False, cat}])
+    };
+
+    If[toggled,
+        SelectionMove[catCell, All, Cell];
+        NotebookWrite[nb, newContent];
+        <|"success" -> True, "category" -> category, "note" -> "Category toggled"|>,
+        <|"success" -> False, "category" -> category, "note" -> "Category not found in checkboxes"|>
+    ]
+];
+
+(* List all available WFR categories *)
+ExecuteNotebookCommand["ListWFRCategories", params_Association] := Module[
+    {spec, nb, cells, catCells, catCell, content, categories},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    cells = Cells[nb];
+    catCells = Select[cells, MemberQ[Flatten[{CurrentValue[#, CellTags]}], "Categories-Checkboxes"] &];
+    If[Length[catCells] == 0, Return[<|"error" -> "No Categories cell found"|>]];
+
+    catCell = First[catCells];
+    content = NotebookRead[catCell];
+
+    (* Extract all checkbox categories and their states *)
+    categories = Cases[content,
+        CheckboxBox[state_, {False, cat_String}] :> <|"name" -> cat, "checked" -> (state =!= False)|>,
+        Infinity];
+
+    <|"success" -> True, "count" -> Length[categories], "categories" -> categories|>
+];
+
+(* Set options on a cell by index *)
+ExecuteNotebookCommand["SetCellOptions", params_Association] := Module[
+    {spec, idx, nb, cells, cell, options, cellStyle, otherOpts},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    idx = Lookup[params, "index", 1];
+    options = Lookup[params, "options", <||>];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    cells = Cells[nb];
+    If[idx < 1 || idx > Length[cells],
+        Return[<|"error" -> "Index out of range", "cellCount" -> Length[cells]|>]
+    ];
+
+    cell = cells[[idx]];
+
+    (* Handle CellStyle separately - requires FrontEndToken *)
+    cellStyle = Lookup[options, "CellStyle", Missing[]];
+    If[!MissingQ[cellStyle],
+        SelectionMove[cell, All, Cell];
+        FrontEndTokenExecute[nb, "Style", cellStyle];
+    ];
+
+    (* Handle other options via SetOptions *)
+    otherOpts = KeyDrop[options, "CellStyle"];
+    Do[
+        SetOptions[cell, Symbol[key] -> val],
+        {key -> val, Normal[otherOpts]}
+    ];
+
+    <|"success" -> True, "index" -> idx, "optionsSet" -> Keys[options]|>
+];
+
+(* Apply Template Input formatting using the actual WFR button implementation *)
+(* Uses DefinitionNotebookClient`TemplateInput[] which is what the Template Input button calls *)
+ExecuteNotebookCommand["TriggerTemplateInput", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    (* Load DefinitionNotebookClient and call TemplateInput on current selection *)
+    Needs["DefinitionNotebookClient`"];
+    DefinitionNotebookClient`TemplateInput[];
+
+    <|"success" -> True, "note" -> "Applied DefinitionNotebookClient`TemplateInput formatting"|>
+];
+
+(* Evaluate initialization cells in a notebook *)
+ExecuteNotebookCommand["EvaluateInitializationCells", params_Association] := Module[
+    {spec, nb, initCells},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    (* Use NotebookEvaluate with EvaluationElements to evaluate only initialization cells *)
+    NotebookEvaluate[nb, EvaluationElements -> "InitializationCell"];
+
+    <|"success" -> True, "note" -> "Evaluated all initialization cells"|>
+];
+
 (* Trigger a button programmatically by extracting and executing its ButtonFunction *)
 ExecuteNotebookCommand["TriggerButton", params_Association] := Module[
     {spec, nb, label, index, cells, cellExprs, buttonBoxes, dockedButtons,

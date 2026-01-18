@@ -253,16 +253,17 @@ ExportWolframNotebookPalette[] := Module[{notebook, file, dir},
                             command = Lookup[request, "command", "unknown"];
                             params = Lookup[request, "params", <||>];
 
-                            (* Log the command with key params *)
+                            (* Log the command with key params - ensure all parts are strings *)
                             timestamp = DateString[{"Hour", ":", "Minute", ":", "Second"}];
-                            Module[{logEntry, paramStr},
-                                paramStr = Switch[command,
+                            Module[{logEntry, paramStr, cmdStr},
+                                cmdStr = ToString[command];
+                                paramStr = Quiet@Check[Switch[cmdStr,
                                     "ClickButton", " idx:" <> ToString[Lookup[params, "index", "?"]] <> " nb:" <> StringTake[ToString[Lookup[params, "notebook", "?"]], UpTo[10]],
                                     "SendArrowKey", " " <> ToString[Lookup[params, "direction", "?"]],
                                     "MouseClick", " x:" <> ToString[Lookup[params, "x", "?"]] <> " y:" <> ToString[Lookup[params, "y", "?"]],
                                     _, ""
-                                ];
-                                logEntry = timestamp <> " " <> command <> paramStr;
+                                ], ""];
+                                logEntry = timestamp <> " " <> cmdStr <> ToString[paramStr];
                                 PrependTo[logVar, logEntry]
                             ];
                             If[Length[logVar] > 20, logVar = Take[logVar, 20]];
