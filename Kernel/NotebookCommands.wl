@@ -115,10 +115,15 @@ ExecuteNotebookCommand["GetAllNotebooksImage", params_Association] := Module[
 ];
 
 ExecuteNotebookCommand["CaptureScreen", params_Association] := Module[
-    {tempFile, result, img, dims, file},
+    {tempFile, result, img, dims, file, screen, args},
     tempFile = FileNameJoin[{$TemporaryDirectory, "screen_capture_" <> ToString[RandomInteger[10^9]] <> ".png"}];
-    result = RunProcess[{"screencapture", "-x", "-C", tempFile}]; (* -C shows cursor *)
-    If[result["ExitCode"] =!= 0, Return[<|"error" -> "screencapture failed"|>]];
+    screen = Lookup[params, "screen", None];
+    args = If[IntegerQ[screen],
+        {"screencapture", "-x", "-C", "-D", ToString[screen], tempFile},  (* -D<n> captures display n *)
+        {"screencapture", "-x", "-C", tempFile}  (* captures all screens *)
+    ];
+    result = RunProcess[args];
+    If[result["ExitCode"] =!= 0, Return[<|"error" -> "screencapture failed: " <> result["StandardError"]|>]];
     If[!FileExistsQ[tempFile], Return[<|"error" -> "Screenshot file not created"|>]];
     img = Import[tempFile];
     DeleteFile[tempFile];
@@ -128,8 +133,251 @@ ExecuteNotebookCommand["CaptureScreen", params_Association] := Module[
     <|
         "file" -> file,
         "width" -> dims[[1]],
-        "height" -> dims[[2]]
+        "height" -> dims[[2]],
+        "screen" -> If[IntegerQ[screen], screen, "all"]
     |>
+];
+
+(* Get information about docked cells including buttons *)
+ExecuteNotebookCommand["GetDockedCells", params_Association] := Module[
+    {spec, nb, dockedCells, extractButtons, styleDefinitions, templateNames},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = findNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found: " <> spec|>]];
+
+    dockedCells = CurrentValue[nb, DockedCells];
+
+    (* Find TemplateBox names used in docked cells *)
+    templateNames = Cases[dockedCells, TemplateBox[_, name_String, ___] :> name, Infinity];
+
+    (* Extract button labels from the docked cell structure *)
+    extractButtons[expr_] := Cases[
+        expr,
+        ButtonBox[label_, opts___] :> <|
+            "label" -> If[StringQ[label], label, ToString[Short[label, 1]]],
+            "hasFunction" -> MemberQ[{opts}, (ButtonFunction -> _) | ("ButtonFunction" -> _)]
+        |>,
+        Infinity
+    ];
+
+    <|
+        "success" -> True,
+        "notebook" -> ToString[nb],
+        "hasDockedCells" -> dockedCells =!= {},
+        "templateNames" -> templateNames,
+        "buttons" -> extractButtons[dockedCells],
+        "rawPreview" -> ToString[Short[dockedCells, 2]]
+    |>
+];
+
+(* Find button positions using GetBoxPositions *)
+ExecuteNotebookCommand["FindButtons", params_Association] := Module[
+    {spec, nb, labelPattern, positions, filtered},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    labelPattern = Lookup[params, "label", None];
+    nb = findNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found: " <> spec|>]];
+
+    (* Use GetBoxPositions to find all ButtonBox elements *)
+    positions = Quiet @ ResourceFunction["GetBoxPositions"][nb, _ButtonBox];
+
+    If[!ListQ[positions] || positions === {},
+        Return[<|"success" -> True, "buttons" -> {}, "note" -> "No buttons found or GetBoxPositions unavailable"|>]
+    ];
+
+    (* Extract button info with positions *)
+    filtered = Map[
+        Function[{pos},
+            Module[{box, label, rect},
+                box = pos["Box"];
+                label = If[MatchQ[box, ButtonBox[lbl_, ___]],
+                    If[StringQ[First[box]], First[box], ToString[Short[First[box], 1]]],
+                    "unknown"
+                ];
+                rect = pos["Rectangle"];
+                <|
+                    "label" -> label,
+                    "x" -> Mean[{rect[[1, 1]], rect[[2, 1]]}],
+                    "y" -> Mean[{rect[[1, 2]], rect[[2, 2]]}],
+                    "rectangle" -> ToString[rect]
+                |>
+            ]
+        ],
+        positions
+    ];
+
+    (* Filter by label if specified *)
+    If[StringQ[labelPattern],
+        filtered = Select[filtered, StringContainsQ[#["label"], labelPattern, IgnoreCase -> True] &]
+    ];
+
+    <|"success" -> True, "buttons" -> filtered, "count" -> Length[filtered]|>
+];
+
+(* Get template definition from notebook's StyleDefinitions *)
+ExecuteNotebookCommand["GetStyleTemplate", params_Association] := Module[
+    {spec, nb, templateName, styleDefs, templateDef, buttons},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    templateName = Lookup[params, "template", Missing["template"]];
+    If[!StringQ[templateName], Return[<|"error" -> "template parameter required"|>]];
+
+    nb = findNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found: " <> spec|>]];
+
+    (* Get the display function for this template from the notebook's style environment *)
+    templateDef = Quiet @ CurrentValue[nb, {StyleDefinitions, templateName, "DisplayFunction"}];
+
+    If[templateDef === {} || templateDef === None || MissingQ[templateDef],
+        (* Try via TemplateBoxOptions *)
+        templateDef = Quiet @ CurrentValue[nb, {StyleDefinitions, templateName, TemplateBoxOptions, DisplayFunction}];
+    ];
+
+    (* Extract buttons from the template definition *)
+    buttons = If[templateDef =!= {} && templateDef =!= None && !MissingQ[templateDef],
+        Cases[templateDef, ButtonBox[lbl_, ___] :> ToString[Short[lbl, 1]], Infinity],
+        {}
+    ];
+
+    <|
+        "success" -> True,
+        "template" -> templateName,
+        "hasDefinition" -> (templateDef =!= {} && templateDef =!= None && !MissingQ[templateDef]),
+        "buttons" -> buttons,
+        "preview" -> ToString[Short[templateDef, 3]]
+    |>
+];
+
+(* Click at specific screen coordinates *)
+ExecuteNotebookCommand["ClickAtPosition", params_Association] := Module[
+    {x, y, button, result},
+    x = Lookup[params, "x", Missing["x"]];
+    y = Lookup[params, "y", Missing["y"]];
+    button = Lookup[params, "button", "left"];
+
+    If[!NumberQ[x] || !NumberQ[y],
+        Return[<|"error" -> "x and y coordinates required (numbers)"|>]
+    ];
+
+    (* Use AppleScript to click at position *)
+    result = RunProcess[{"osascript", "-e",
+        StringTemplate["tell application \"System Events\" to click at {`x`, `y`}"][<|"x" -> Round[x], "y" -> Round[y]|>]
+    }];
+
+    If[result["ExitCode"] =!= 0,
+        <|"error" -> "Click failed: " <> result["StandardError"]|>,
+        <|"success" -> True, "clicked" -> {Round[x], Round[y]}|>
+    ]
+];
+
+(* Get notebook window bounds for calculating absolute click positions *)
+ExecuteNotebookCommand["GetWindowBounds", params_Association] := Module[
+    {spec, nb, windowSize, windowMargins, windowFrame},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = findNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found: " <> spec|>]];
+
+    windowSize = AbsoluteCurrentValue[nb, WindowSize];
+    windowMargins = AbsoluteCurrentValue[nb, WindowMargins];
+    windowFrame = AbsoluteCurrentValue[nb, WindowFrame];
+
+    (* WindowMargins: {{left, right}, {bottom, top}} from screen edges *)
+    (* WindowSize: {width, height} *)
+    <|
+        "success" -> True,
+        "notebook" -> ToString[nb],
+        "size" -> If[MatchQ[windowSize, {_?NumericQ, _?NumericQ}], windowSize, "unknown"],
+        "margins" -> If[MatchQ[windowMargins, {{_?NumericQ, _?NumericQ}, {_?NumericQ, _?NumericQ}}],
+            <|
+                "left" -> windowMargins[[1, 1]],
+                "right" -> windowMargins[[1, 2]],
+                "bottom" -> windowMargins[[2, 1]],
+                "top" -> windowMargins[[2, 2]]
+            |>,
+            "unknown"
+        ],
+        "frame" -> ToString[windowFrame]
+    |>
+];
+
+(* Close any open modal dialogs *)
+ExecuteNotebookCommand["CloseDialogs", params_Association] := Module[
+    {dialogs, closed},
+    (* Close dialogs by WindowFrame *)
+    dialogs = Select[Notebooks[], CurrentValue[#, WindowFrame] =!= "Normal" &];
+    closed = Length[dialogs];
+    NotebookClose /@ dialogs;
+
+    (* Also try clicking "No" on common dialog questions via keyboard *)
+    FrontEndExecute[FrontEnd`KeyboardMouse -> "n"];
+
+    <|"success" -> True, "closed" -> closed|>
+];
+
+(* WFR-specific actions: Check, Preview, Deploy *)
+ExecuteNotebookCommand["WFRAction", params_Association] := Module[
+    {spec, nb, action, result},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    action = Lookup[params, "action", Missing["action"]];
+    If[!StringQ[action], Return[<|"error" -> "action parameter required (Check, Preview, Deploy)"|>]];
+
+    nb = findNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found: " <> spec|>]];
+
+    Needs["DefinitionNotebookClient`"];
+
+    result = Switch[ToLowerCase[action],
+        "check",
+            DefinitionNotebookClient`CheckDefinitionNotebook[nb],
+        "preview",
+            DefinitionNotebookClient`PreviewResource[nb],
+        "deploy",
+            (* Deploy typically requires authentication *)
+            DefinitionNotebookClient`DeployResource[nb],
+        _,
+            Return[<|"error" -> "Unknown action: " <> action <> ". Supported: Check, Preview, Deploy"|>]
+    ];
+
+    <|
+        "success" -> True,
+        "action" -> action,
+        "result" -> ToString[Short[result, 5]]
+    |>
+];
+
+(* Click a button in the docked cell by label *)
+ExecuteNotebookCommand["ClickDockedButton", params_Association] := Module[
+    {spec, nb, label, dockedCells, buttonPattern, found, buttonFunc},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    label = Lookup[params, "label", Missing["label"]];
+    If[!StringQ[label], Return[<|"error" -> "label parameter required"|>]];
+
+    nb = findNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found: " <> spec|>]];
+
+    dockedCells = CurrentValue[nb, DockedCells];
+
+    (* Find button with matching label and extract its function *)
+    found = FirstCase[
+        dockedCells,
+        ButtonBox[lbl_, opts___] /; StringContainsQ[ToString[lbl], label, IgnoreCase -> True] :>
+            <|"label" -> ToString[Short[lbl, 1]], "opts" -> {opts}|>,
+        Missing["NoMatch"],
+        Infinity
+    ];
+
+    If[MissingQ[found], Return[<|"error" -> "Button not found with label containing: " <> label|>]];
+
+    (* Extract ButtonFunction from options *)
+    buttonFunc = FirstCase[found["opts"], (ButtonFunction -> f_) | ("ButtonFunction" -> f_) :> f, Missing["NoFunction"]];
+
+    If[MissingQ[buttonFunc],
+        <|"error" -> "Button found but has no ButtonFunction", "button" -> found["label"]|>,
+        (* Execute the button function with proper context *)
+        Block[{$CurrentNotebook = nb, ButtonNotebook = Function[nb]},
+            buttonFunc[];
+        ];
+        <|"success" -> True, "clicked" -> found["label"]|>
+    ]
 ];
 
 ExecuteNotebookCommand["SelectNotebook", params_Association] := Module[{spec, nb},
@@ -1108,6 +1356,359 @@ ExecuteNotebookCommand["SendArrowKey", params_Association] := Module[
         "spec" -> spec,
         "timestamp" -> timestamp
     |>
+];
+
+(* Update descriptions in a Guide notebook *)
+ExecuteNotebookCommand["UpdateGuideDescriptions", params_Association] := Module[
+    {spec, replacements, nb, cells, count = 0, content, newContent, extractName},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    replacements = Lookup[params, "replacements", <||>];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    (* Extract symbol name from various box structures *)
+    extractName[Cell[BoxData[name_String], "InlineGuideFunction", ___]] := name;
+    extractName[Cell[BoxData[ButtonBox[name_String, ___]], "InlineGuideFunction", ___]] := name;
+    extractName[Cell[BoxData[TemplateBox[{name_, ___}, "RefLink", ___]], ___]] := name;
+    extractName[_] := Missing[];
+
+    cells = Cells[nb, CellStyle -> "GuideText"];
+
+    Scan[Function[cell,
+        content = NotebookRead[cell];
+
+        (* Find the symbol name from the first element of TextData *)
+        If[MatchQ[content, Cell[TextData[{elem_, ___}], ___]],
+            With[{name = extractName[content[[1, 1]]]},
+                If[!MissingQ[name] && KeyExistsQ[replacements, name],
+                    (* Replace FrameBox["description"] with the actual description *)
+                    newContent = content /. FrameBox["description"] :> replacements[name];
+                    If[newContent =!= content,
+                        NotebookWrite[cell, newContent];
+                        count++;
+                    ]
+                ]
+            ]
+        ];
+    ], cells];
+
+    <|"success" -> True, "updated_cells" -> count|>
+];
+
+(* Update a single guide description by cell index *)
+ExecuteNotebookCommand["UpdateGuideDescription", params_Association] := Module[
+    {spec, idx, description, nb, cells, cell, content, newContent, name},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    idx = Lookup[params, "index", 1];
+    description = Lookup[params, "description", ""];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    cells = Cells[nb];
+    If[idx < 1 || idx > Length[cells], Return[<|"error" -> "Index out of range"|>]];
+
+    cell = cells[[idx]];
+    content = NotebookRead[cell];
+
+    (* Extract symbol name for reference *)
+    name = FirstCase[content,
+        Cell[BoxData[s_String], "InlineGuideFunction", ___] :> s,
+        FirstCase[content, Cell[BoxData[ButtonBox[s_String, ___]], "InlineGuideFunction", ___] :> s, "unknown", Infinity],
+        Infinity];
+
+    (* Replace the pattern: {functionCell, " \[LongDash] ", placeholderCell} -> {functionCell, " \[LongDash] description"} *)
+    newContent = content /. {
+        Cell[TextData[{funcCell_, " \[LongDash] ", Cell[BoxData[TagBox[TagBox[FrameBox["description"], ___], ___]], ___]}], style_, opts___] :>
+            Cell[TextData[{funcCell, " \[LongDash] " <> description}], style, opts]
+    };
+
+    If[newContent =!= content,
+        SelectionMove[cell, All, Cell];
+        NotebookWrite[nb, newContent];
+        <|"success" -> True, "name" -> name, "description" -> description|>,
+        <|"success" -> False, "note" -> "No placeholder found to replace", "name" -> name, "content" -> ToString[content, InputForm]|>
+    ]
+];
+
+(* Convert unlinked function name to linked ButtonBox in a GuideText cell *)
+ExecuteNotebookCommand["LinkGuideFunction", params_Association] := Module[
+    {spec, idx, pacletName, nb, cells, cell, content, newContent, name},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    idx = Lookup[params, "index", 1];
+    pacletName = Lookup[params, "paclet", "Wolfram/DiagrammaticComputation"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    cells = Cells[nb];
+    If[idx < 1 || idx > Length[cells], Return[<|"error" -> "Index out of range"|>]];
+
+    cell = cells[[idx]];
+    content = NotebookRead[cell];
+
+    (* Find unlinked function name and convert to linked ButtonBox *)
+    name = FirstCase[content, Cell[BoxData[s_String], "InlineGuideFunction", ___] :> s, Missing[], Infinity];
+
+    If[MissingQ[name],
+        Return[<|"success" -> False, "note" -> "No unlinked function name found (already linked or different format)"|>]
+    ];
+
+    (* Replace plain string with ButtonBox *)
+    newContent = content /. {
+        Cell[BoxData[s_String], style : "InlineGuideFunction", opts___] :>
+            Cell[BoxData[ButtonBox[s, BaseStyle -> "Link",
+                ButtonData -> "paclet:" <> pacletName <> "/ref/" <> s]], style, opts]
+    };
+
+    If[newContent =!= content,
+        SelectionMove[cell, All, Cell];
+        NotebookWrite[nb, newContent];
+        <|"success" -> True, "name" -> name, "linked" -> True|>,
+        <|"success" -> False, "note" -> "Failed to transform content", "name" -> name|>
+    ]
+];
+
+(* Open a palette by name *)
+ExecuteNotebookCommand["OpenPalette", params_Association] := Module[
+    {name, palettePath, nb},
+    name = Lookup[params, "name", ""];
+    If[name === "", Return[<|"error" -> "Palette name required"|>]];
+
+    (* Try to find the palette in standard locations *)
+    palettePath = FrontEnd`FindFileOnPath[name <> ".nb", "PalettePath"];
+    If[palettePath === $Failed,
+        palettePath = FrontEnd`FindFileOnPath[name <> ".nb", "PrivatePaths"];
+    ];
+
+    If[palettePath === $Failed,
+        Return[<|"error" -> "Palette not found: " <> name|>]
+    ];
+
+    (* Open the palette *)
+    nb = NotebookOpen[palettePath];
+
+    If[MatchQ[nb, _NotebookObject],
+        <|"success" -> True, "palette" -> name, "notebook" -> ToString[nb]|>,
+        <|"error" -> "Failed to open palette"|>
+    ]
+];
+
+(* List available palettes *)
+ExecuteNotebookCommand["ListPalettes", params_Association] := Module[
+    {paletteDirs, palettes},
+    paletteDirs = {
+        FileNameJoin[{$InstallationDirectory, "SystemFiles", "FrontEnd", "Palettes"}],
+        FileNameJoin[{$UserBaseDirectory, "SystemFiles", "FrontEnd", "Palettes"}]
+    };
+    palettes = Flatten[FileNames["*.nb", #] & /@ Select[paletteDirs, DirectoryQ]];
+    <|"success" -> True, "palettes" -> (FileBaseName /@ palettes)|>
+];
+
+(* Get docked cells info from current notebook *)
+ExecuteNotebookCommand["GetDockedCellButtons", params_Association] := Module[
+    {spec, nb, dockedCells, buttons},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    dockedCells = CurrentValue[nb, DockedCells];
+
+    (* Extract button information *)
+    buttons = Cases[dockedCells,
+        ButtonBox[label_, opts___] :> <|
+            "label" -> ToString[Short[label, 1]],
+            "hasFunction" -> MemberQ[{opts}, ButtonFunction -> _]
+        |>,
+        Infinity
+    ];
+
+    <|"success" -> True, "buttonCount" -> Length[buttons], "buttons" -> buttons|>
+];
+
+(* Execute a docked cell button by label pattern *)
+ExecuteNotebookCommand["ClickDockedCellButton", params_Association] := Module[
+    {spec, nb, labelPattern, dockedCells, button, buttonFunc},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    labelPattern = Lookup[params, "label", ""];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+    If[labelPattern === "", Return[<|"error" -> "Label pattern required"|>]];
+
+    dockedCells = CurrentValue[nb, DockedCells];
+
+    (* Find button matching the label pattern *)
+    button = FirstCase[dockedCells,
+        ButtonBox[label_, opts___] /; StringContainsQ[ToString[label], labelPattern, IgnoreCase -> True] :>
+            <|"label" -> ToString[Short[label, 1]], "opts" -> {opts}|>,
+        Missing["NotFound"],
+        Infinity
+    ];
+
+    If[MissingQ[button],
+        Return[<|"error" -> "Button not found matching: " <> labelPattern|>]
+    ];
+
+    (* Extract and execute ButtonFunction *)
+    buttonFunc = FirstCase[button["opts"],
+        (ButtonFunction -> f_) :> f,
+        Missing["NoFunction"]
+    ];
+
+    If[MissingQ[buttonFunc],
+        <|"success" -> False, "note" -> "Button has no ButtonFunction", "label" -> button["label"]|>,
+        (* Execute with proper notebook context *)
+        Block[{ButtonNotebook = Function[nb]},
+            buttonFunc[]
+        ];
+        <|"success" -> True, "clicked" -> button["label"]|>
+    ]
+];
+
+
+(* Documentation Toolbar Functions - from DefinitionNotebookClient *)
+
+(* Insert a delimiter line *)
+ExecuteNotebookCommand["InsertDelimiter", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    SetSelectedNotebook[nb];
+    DefinitionNotebookClient`DelimiterInsert[];
+
+    <|"success" -> True, "action" -> "Delimiter inserted"|>
+];
+
+(* Insert a function link button (like clicking a function name in docs) *)
+ExecuteNotebookCommand["InsertFunctionLink", params_Association] := Module[
+    {spec, nb, funcName},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    funcName = Lookup[params, "function", ""];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+    If[funcName === "", Return[<|"error" -> "function parameter required"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    SetSelectedNotebook[nb];
+    (* Insert the function as template input *)
+    NotebookWrite[nb, funcName];
+    SelectionMove[nb, Previous, Word];
+    DefinitionNotebookClient`TemplateInput[];
+
+    <|"success" -> True, "function" -> funcName|>
+];
+
+(* Toggle cell style (cycles through styles) *)
+ExecuteNotebookCommand["StyleToggle", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    SetSelectedNotebook[nb];
+    DefinitionNotebookClient`StyleToggle[];
+
+    <|"success" -> True, "action" -> "Style toggled"|>
+];
+
+(* Insert a table *)
+ExecuteNotebookCommand["InsertTable", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    SetSelectedNotebook[nb];
+    DefinitionNotebookClient`TableInsert[];
+
+    <|"success" -> True, "action" -> "Table inserted"|>
+];
+
+(* Insert a table row *)
+ExecuteNotebookCommand["InsertTableRow", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    SetSelectedNotebook[nb];
+    DefinitionNotebookClient`TableRowInsert[];
+
+    <|"success" -> True, "action" -> "Table row inserted"|>
+];
+
+(* Insert a subscript *)
+ExecuteNotebookCommand["InsertSubscript", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    SetSelectedNotebook[nb];
+    DefinitionNotebookClient`SubscriptInsert[];
+
+    <|"success" -> True, "action" -> "Subscript inserted"|>
+];
+
+(* Toggle comments *)
+ExecuteNotebookCommand["ToggleComment", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    SetSelectedNotebook[nb];
+    DefinitionNotebookClient`CommentToggle[];
+
+    <|"success" -> True, "action" -> "Comment toggled"|>
+];
+
+(* Save documentation notebook *)
+ExecuteNotebookCommand["SaveDocNotebook", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    DefinitionNotebookClient`SaveDocumentationNotebook[nb];
+
+    <|"success" -> True, "action" -> "Documentation notebook saved"|>
+];
+
+(* View documentation notebook in paclet documentation format *)
+ExecuteNotebookCommand["ViewDocNotebook", params_Association] := Module[
+    {spec, nb},
+    spec = Lookup[params, "notebook", "InputNotebook"];
+    nb = getNotebook[spec];
+    If[!MatchQ[nb, _NotebookObject], Return[<|"error" -> "Notebook not found"|>]];
+
+    Needs["DefinitionNotebookClient`"];
+    DefinitionNotebookClient`ViewDocumentationNotebook[nb];
+
+    <|"success" -> True, "action" -> "Documentation notebook opened in viewer"|>
+];
+
+(* List available toolbar actions from DefinitionNotebookClient *)
+ExecuteNotebookCommand["ListToolbarActions", params_Association] := Module[{},
+    <|"success" -> True, "actions" -> {
+        "TriggerTemplateInput" -> "Apply Template Input formatting to selection",
+        "InsertDelimiter" -> "Insert a delimiter line",
+        "InsertFunctionLink" -> "Insert and format a function link",
+        "StyleToggle" -> "Toggle cell style",
+        "InsertTable" -> "Insert a table",
+        "InsertTableRow" -> "Insert a table row",
+        "InsertSubscript" -> "Insert a subscript",
+        "ToggleComment" -> "Toggle comment on selection",
+        "SaveDocNotebook" -> "Save documentation notebook",
+        "ViewDocNotebook" -> "View documentation in paclet format"
+    }|>
 ];
 
 (* Default handler for unknown commands *)
